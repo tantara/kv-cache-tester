@@ -1537,15 +1537,23 @@ class APIClient:
             "top_k": 20,
             "repetition_penalty": 1.05,
         },
+        "minimax": {
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "top_k": 40,
+        },
     }
 
     def __init__(self, api_endpoint: str, model: str = "",
+                 api_key: str = "EMPTY",
+                 sampling_profile: Optional[str] = None,
                  temperature: Optional[float] = None,
                  top_p: Optional[float] = None,
                  top_k: Optional[int] = None,
                  repetition_penalty: Optional[float] = None):
         self.api_endpoint = api_endpoint
         self.model = model
+        self.api_key = api_key
 
         # Store user-specified overrides (None means use model defaults or auto-detect)
         self._user_temperature = temperature
@@ -1565,55 +1573,75 @@ class APIClient:
             base_url = base_url + '/v1'
 
         self.client = openai.AsyncOpenAI(
-            api_key="EMPTY",
+            api_key=api_key,
             base_url=base_url
         )
 
         logger.info(f"API Client initialized: {api_endpoint}")
+        if model:
+            logger.info(f"Model: {model}")
+        if sampling_profile:
+            self._apply_sampling_profile(sampling_profile)
+        elif model:
+            self._apply_model_defaults()
+
+    def _apply_defaults_dict(self, defaults: dict, label: str) -> None:
+        """Apply a MODEL_DEFAULTS entry unless the user set explicit overrides."""
+        applied_settings = []
+        if self._user_temperature is None and "temperature" in defaults:
+            self.temperature = defaults["temperature"]
+            applied_settings.append(f"temperature={self.temperature}")
+        if self._user_top_p is None and "top_p" in defaults:
+            self.top_p = defaults["top_p"]
+            applied_settings.append(f"top_p={self.top_p}")
+        if self._user_top_k is None and "top_k" in defaults:
+            self.top_k = defaults["top_k"]
+            applied_settings.append(f"top_k={self.top_k}")
+        if self._user_repetition_penalty is None and "repetition_penalty" in defaults:
+            self.repetition_penalty = defaults["repetition_penalty"]
+            applied_settings.append(f"repetition_penalty={self.repetition_penalty}")
+
+        if applied_settings:
+            logger.info(
+                f"{Colors.OKCYAN}Applying {label} sampling defaults: "
+                f"{', '.join(applied_settings)}{Colors.ENDC}"
+            )
+
+    def _apply_sampling_profile(self, profile: str) -> None:
+        """Apply named sampling defaults (e.g. minimax) without matching --model text."""
+        defaults = self.MODEL_DEFAULTS.get(profile)
+        if defaults is None:
+            known = ", ".join(sorted(self.MODEL_DEFAULTS))
+            logger.warning(f"Unknown sampling profile '{profile}'. Known profiles: {known}")
+            return
+        self._apply_defaults_dict(defaults, f"{profile} profile")
 
     def _apply_model_defaults(self):
         """Apply model-specific default parameters if not overridden by user."""
         model_lower = self.model.lower()
 
-        # Check for matching model patterns
-        matched_defaults = None
-        matched_pattern = None
         for pattern, defaults in self.MODEL_DEFAULTS.items():
             if pattern in model_lower:
-                matched_defaults = defaults
-                matched_pattern = pattern
-                break
-
-        if matched_defaults:
-            applied_settings = []
-            if self._user_temperature is None and "temperature" in matched_defaults:
-                self.temperature = matched_defaults["temperature"]
-                applied_settings.append(f"temperature={self.temperature}")
-            if self._user_top_p is None and "top_p" in matched_defaults:
-                self.top_p = matched_defaults["top_p"]
-                applied_settings.append(f"top_p={self.top_p}")
-            if self._user_top_k is None and "top_k" in matched_defaults:
-                self.top_k = matched_defaults["top_k"]
-                applied_settings.append(f"top_k={self.top_k}")
-            if self._user_repetition_penalty is None and "repetition_penalty" in matched_defaults:
-                self.repetition_penalty = matched_defaults["repetition_penalty"]
-                applied_settings.append(f"repetition_penalty={self.repetition_penalty}")
-
-            if applied_settings:
-                logger.info(f"{Colors.OKCYAN}Detected {matched_pattern} model - applying settings: {', '.join(applied_settings)}{Colors.ENDC}")
+                self._apply_defaults_dict(defaults, f"{pattern} model")
+                return
 
     async def detect_model(self) -> str:
         """Auto-detect model from API and apply model-specific settings."""
+        if self.model:
+            return self.model
+
         try:
             models_url = self.api_endpoint.rstrip('/') + '/v1/models'
             import aiohttp
+            headers = {}
+            if self.api_key and self.api_key != "EMPTY":
+                headers["Authorization"] = f"Bearer {self.api_key}"
             async with aiohttp.ClientSession() as session:
-                async with session.get(models_url, timeout=10) as response:
+                async with session.get(models_url, headers=headers, timeout=10) as response:
                     data = await response.json()
                     if 'data' in data and len(data['data']) > 0:
                         self.model = data['data'][0]['id']
                         logger.info(f"Auto-detected model: {self.model}")
-                        # Apply model-specific defaults
                         self._apply_model_defaults()
                         return self.model
         except Exception as e:
@@ -3402,6 +3430,10 @@ def parse_arguments():
     # Required arguments
     parser.add_argument("--api-endpoint", type=str, required=True,
                         help="API server endpoint (e.g., http://localhost:8000)")
+    parser.add_argument("--api-key", type=str, default=None,
+                        help="API key for authenticated endpoints. Defaults to EMPTY for local vLLM.")
+    parser.add_argument("--model", type=str, default=None,
+                        help="Model or deployment ID. Required for remote APIs; auto-detected for local vLLM.")
     parser.add_argument("--trace-directory", type=str, required=True,
                         help="Directory containing trace JSON files")
     parser.add_argument("--output-dir", type=str, required=True,
@@ -3473,6 +3505,14 @@ def parse_arguments():
                         help="Seed for synthetic prompt content and warm prefix (overrides --seed for prompt generation)")
 
     # Generation parameter overrides (None = use model-specific defaults if available)
+    parser.add_argument(
+        "--sampling-profile",
+        type=str,
+        default=None,
+        choices=sorted(APIClient.MODEL_DEFAULTS.keys()),
+        help="Named sampling defaults when --model is a deployment id without the "
+             "base model name (e.g. accounts/.../deployments/g3rf6tml).",
+    )
     parser.add_argument("--temperature", type=float, default=None,
                         help="Override temperature for generation (e.g., 0.7)")
     parser.add_argument("--top-p", type=float, default=None,
@@ -3686,12 +3726,19 @@ async def main():
     generator = SyntheticMessageGenerator(config.tokenizer_id, config.chunk_size, config.prompt_generation_seed)
     api_client = APIClient(
         config.api_endpoint,
+        model=args.model or "",
+        api_key=args.api_key or "EMPTY",
+        sampling_profile=args.sampling_profile,
         temperature=config.temperature,
         top_p=config.top_p,
         top_k=config.top_k,
         repetition_penalty=config.repetition_penalty
     )
     await api_client.detect_model()
+    if not api_client.model:
+        logger.error("No model specified and auto-detection failed. "
+                     "Pass --model explicitly.")
+        return
 
     # Create orchestrator
     orchestrator = TestOrchestrator(config, trace_manager, generator, api_client)
