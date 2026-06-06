@@ -3510,8 +3510,8 @@ def parse_arguments():
         type=str,
         default=None,
         choices=sorted(APIClient.MODEL_DEFAULTS.keys()),
-        help="Named sampling defaults when --model is a deployment id without the "
-             "base model name (e.g. accounts/.../deployments/g3rf6tml).",
+        help="Apply named sampling defaults when --model is an opaque ID that does "
+             "not match built-in model name patterns for automatic detection.",
     )
     parser.add_argument("--temperature", type=float, default=None,
                         help="Override temperature for generation (e.g., 0.7)")
