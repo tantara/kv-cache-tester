@@ -316,15 +316,17 @@ class RequestMetrics:
     request_type: str  # streaming or non_streaming
     input_tokens: int
     output_tokens_expected: int
-    output_tokens_actual: int
+    output_tokens_actual: int  # Total generated tokens (content + reasoning)
     cache_hit_blocks: int
     cache_miss_blocks: int
-    ttft: float
+    ttft: float  # Time to first token (content or reasoning)
     ttlt: float
     itl: float
     delay_expected: float
     delay_actual: float
     success: bool
+    content_tokens_actual: int = 0  # Content tokens only (excludes reasoning)
+    ttfc: float = 0.0  # Time to first content token
     error_message: Optional[str] = None
     # Queue and effective experience metrics
     queue_time: float = 0.0  # Time spent waiting in rate_limited/queued state before dispatch
@@ -332,10 +334,13 @@ class RequestMetrics:
     # Timestamps for period attribution
     request_start_time: float = 0.0  # When request was sent
     prefill_complete_time: float = 0.0  # When first token received (TTFT)
+    first_content_time: float = 0.0  # When first content token received (TTFC)
     request_complete_time: float = 0.0  # When last token received
     # Token chunk timing for proportional output attribution
     token_timestamps: List[float] = field(default_factory=list)
     tokens_per_chunk: List[int] = field(default_factory=list)
+    content_token_timestamps: List[float] = field(default_factory=list)
+    content_tokens_per_chunk: List[int] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -369,11 +374,16 @@ class AssessmentPeriodMetrics:
     requests_in_progress_prior: int  # In-flight requests started prior periods
     requests_per_second: float
     input_tokens_per_second: float
-    output_tokens_per_second: float
+    tokens_per_second: float  # All generated tokens (content + reasoning)
+    output_tokens_per_second: float  # Content tokens only
     ttft_avg: float
     ttft_p50: float
     ttft_p95: float
     ttft_p99: float
+    ttfc_avg: float
+    ttfc_p50: float
+    ttfc_p95: float
+    ttfc_p99: float
     avg_cache_hit_rate: float
     working_set_blocks: int
     users_added: int
@@ -1679,6 +1689,7 @@ class APIClient:
     async def send_request(self, messages: List[dict], max_tokens: int, stream: bool = True,
                            on_first_token: Optional[callable] = None,
                            on_chunk: Optional[callable] = None,
+                           on_content_chunk: Optional[callable] = None,
                            tokenizer=None) -> dict:
         """
         Send request and return metrics.
@@ -1688,17 +1699,28 @@ class APIClient:
             max_tokens: Maximum tokens to generate
             stream: Whether to use streaming (default True)
             on_first_token: Optional callback invoked when first token arrives (prefill complete)
+            on_chunk: Optional callback for all generated tokens (content + reasoning)
+            on_content_chunk: Optional callback for content tokens only
 
-        Returns dict with: response_text, ttft, ttlt, actual_output_tokens, error_type,
-                          start_time, first_token_time, complete_time (absolute timestamps),
-                          token_timestamps, tokens_per_chunk (for proportional attribution)
+        Returns dict with: response_text, ttft, ttfc, ttlt, output_tokens (total),
+                          content_tokens, error_type, start_time, first_token_time,
+                          first_content_time, complete_time, token_timestamps,
+                          tokens_per_chunk, content_token_timestamps,
+                          content_tokens_per_chunk
         """
         start_time = time.time()
         first_token_time = None
+        first_content_time = None
         response_text = ""
-        token_count = 0
+        total_token_count = 0
+        content_token_count = 0
         token_timestamps: List[float] = []
         tokens_per_chunk: List[int] = []
+        content_token_timestamps: List[float] = []
+        content_tokens_per_chunk: List[int] = []
+
+        def _reasoning_text(delta) -> str:
+            return getattr(delta, 'reasoning_content', None) or getattr(delta, 'reasoning', None) or ""
 
         try:
             params = self._build_request_params(messages, max_tokens, stream)
@@ -1710,28 +1732,34 @@ class APIClient:
                     if chunk.choices:
                         delta = chunk.choices[0].delta
                         content_text = delta.content or ""
-                        reasoning_text = getattr(delta, 'reasoning_content', None) or ""
-                        chunk_text = content_text or reasoning_text
-                        if not chunk_text:
-                            continue
+                        reasoning_text = _reasoning_text(delta)
                         chunk_time = time.time()
-                        if first_token_time is None:
-                            first_token_time = chunk_time
-                            # Signal that prefill is complete (first token received)
-                            if on_first_token:
-                                on_first_token()
-                        # Only add content (not reasoning) to response text for conversation history
+
+                        if content_text or reasoning_text:
+                            if first_token_time is None:
+                                first_token_time = chunk_time
+                                # Signal that prefill is complete (first token received)
+                                if on_first_token:
+                                    on_first_token()
+
+                            any_text = content_text or reasoning_text
+                            chunk_token_count = len(tokenizer.encode(any_text)) if tokenizer else 1
+                            total_token_count += chunk_token_count
+                            token_timestamps.append(chunk_time)
+                            tokens_per_chunk.append(chunk_token_count)
+                            if on_chunk:
+                                on_chunk(chunk_time, chunk_token_count)
+
                         if content_text:
+                            if first_content_time is None:
+                                first_content_time = chunk_time
                             response_text += content_text
-                        # Count all generated tokens (content + reasoning) for metrics
-                        chunk_token_count = len(tokenizer.encode(chunk_text)) if tokenizer else 1
-                        token_count += chunk_token_count
-                        # Track timestamp and token count for this chunk
-                        token_timestamps.append(chunk_time)
-                        tokens_per_chunk.append(chunk_token_count)
-                        # Live callback for real-time output tracking
-                        if on_chunk:
-                            on_chunk(chunk_time, chunk_token_count)
+                            content_chunk_count = len(tokenizer.encode(content_text)) if tokenizer else 1
+                            content_token_count += content_chunk_count
+                            content_token_timestamps.append(chunk_time)
+                            content_tokens_per_chunk.append(content_chunk_count)
+                            if on_content_chunk:
+                                on_content_chunk(chunk_time, content_chunk_count)
 
                 complete_time = time.time()
 
@@ -1739,29 +1767,38 @@ class APIClient:
                 response = await self.client.chat.completions.create(**params)
 
                 first_token_time = time.time()
+                first_content_time = first_token_time
                 complete_time = first_token_time
 
                 if response.choices:
                     response_text = response.choices[0].message.content or ""
-                    token_count = response.usage.completion_tokens if response.usage else len(response_text.split())
-                    # For non-streaming, all tokens are attributed to completion time
+                    total_token_count = response.usage.completion_tokens if response.usage else len(response_text.split())
+                    content_token_count = total_token_count
                     token_timestamps.append(complete_time)
-                    tokens_per_chunk.append(token_count)
+                    tokens_per_chunk.append(total_token_count)
+                    content_token_timestamps.append(complete_time)
+                    content_tokens_per_chunk.append(content_token_count)
 
             ttft = (first_token_time - start_time) if first_token_time else 0
+            ttfc = (first_content_time - start_time) if first_content_time else 0
             ttlt = complete_time - start_time
 
             return {
                 'response_text': response_text,
                 'ttft': ttft,
+                'ttfc': ttfc,
                 'ttlt': ttlt,
-                'output_tokens': token_count,
+                'output_tokens': total_token_count,
+                'content_tokens': content_token_count,
                 'error_type': None,
                 'start_time': start_time,
                 'first_token_time': first_token_time or start_time,
+                'first_content_time': first_content_time or start_time,
                 'complete_time': complete_time,
                 'token_timestamps': token_timestamps,
-                'tokens_per_chunk': tokens_per_chunk
+                'tokens_per_chunk': tokens_per_chunk,
+                'content_token_timestamps': content_token_timestamps,
+                'content_tokens_per_chunk': content_tokens_per_chunk,
             }
 
         except Exception as e:
@@ -1775,14 +1812,19 @@ class APIClient:
             return {
                 'response_text': "",
                 'ttft': 0,
+                'ttfc': 0,
                 'ttlt': 0,
                 'output_tokens': 0,
+                'content_tokens': 0,
                 'error_type': error_type,
                 'start_time': start_time,
                 'first_token_time': start_time,
+                'first_content_time': start_time,
                 'complete_time': time.time(),
                 'token_timestamps': [],
-                'tokens_per_chunk': []
+                'tokens_per_chunk': [],
+                'content_token_timestamps': [],
+                'content_tokens_per_chunk': [],
             }
 
 
@@ -1806,9 +1848,10 @@ class TestOrchestrator:
         self.all_metrics: List[RequestMetrics] = []
         self.assessment_periods: List[AssessmentPeriodMetrics] = []
 
-        # Live output token stream — captures chunks as they arrive from streaming API,
-        # before request completion. Used for accurate per-period output tok/s.
-        self.output_token_log: deque = deque()
+        # Live token streams — capture chunks as they arrive from streaming API,
+        # before request completion. Used for accurate per-period tok/s.
+        self.all_token_log: deque = deque()  # content + reasoning
+        self.content_token_log: deque = deque()  # content only
 
         self.test_start_time: Optional[float] = None
         self.current_period_start: Optional[float] = None
@@ -2276,7 +2319,7 @@ class TestOrchestrator:
 
         Uses timestamps to attribute metrics to periods:
         - Input tokens: counted when prefill completes (at TTFT) in this period
-        - Output tokens: proportionally attributed based on when tokens were GENERATED
+        - Generated tokens: all tokens and content-only tokens attributed from live streams
         - TTFT stats: from requests where prefill completed in this period
         """
         start_time = self.current_period_start or time.time()
@@ -2322,17 +2365,23 @@ class TestOrchestrator:
         # Count unique users who had a request complete prefill this period
         users_with_requests = len(set(m.user_id for m in period_prefill_metrics))
 
-        # TTFT stats from requests that got first token in this period
+        # TTFT/TTFC stats from requests that got first token in this period
         ttfts = [m.ttft for m in period_prefill_metrics]
+        ttfcs = [m.ttfc for m in period_prefill_metrics if m.ttfc > 0]
 
         # Input tokens: attributed when prefill completes (at TTFT)
         input_tokens = sum(m.input_tokens for m in period_prefill_metrics)
 
-        # Output tokens: from live token stream (captures in-flight decode chunks)
-        output_tokens = 0
-        for chunk_time, chunk_tokens in self.output_token_log:
+        # Generated tokens: from live token streams (captures in-flight decode chunks)
+        all_tokens = 0
+        for chunk_time, chunk_tokens in self.all_token_log:
             if start_time < chunk_time <= end_time:
-                output_tokens += chunk_tokens
+                all_tokens += chunk_tokens
+
+        content_tokens = 0
+        for chunk_time, chunk_tokens in self.content_token_log:
+            if start_time < chunk_time <= end_time:
+                content_tokens += chunk_tokens
 
         # Cache stats from prefill completions
         cache_hits = sum(m.cache_hit_blocks for m in period_prefill_metrics)
@@ -2397,11 +2446,16 @@ class TestOrchestrator:
             requests_in_progress_prior=requests_in_progress_prior,
             requests_per_second=len(period_completed_metrics) / duration if duration > 0 else 0,
             input_tokens_per_second=input_tokens / duration if duration > 0 else 0,
-            output_tokens_per_second=output_tokens / duration if duration > 0 else 0,
+            tokens_per_second=all_tokens / duration if duration > 0 else 0,
+            output_tokens_per_second=content_tokens / duration if duration > 0 else 0,
             ttft_avg=np.mean(ttfts) if ttfts else 0,
             ttft_p50=np.percentile(ttfts, 50) if ttfts else 0,
             ttft_p95=np.percentile(ttfts, 95) if ttfts else 0,
             ttft_p99=np.percentile(ttfts, 99) if ttfts else 0,
+            ttfc_avg=np.mean(ttfcs) if ttfcs else 0,
+            ttfc_p50=np.percentile(ttfcs, 50) if ttfcs else 0,
+            ttfc_p95=np.percentile(ttfcs, 95) if ttfcs else 0,
+            ttfc_p99=np.percentile(ttfcs, 99) if ttfcs else 0,
             avg_cache_hit_rate=cache_hits / cache_total if cache_total > 0 else 0,
             working_set_blocks=working_set_blocks,
             users_added=self.period_users_added,
@@ -2424,7 +2478,7 @@ class TestOrchestrator:
             queue_depth=rate_limited_users,
             otpm_bucket_pct=self.otpm_bucket.fill_pct if self.otpm_bucket else 100.0,
             itpm_bucket_pct=self.itpm_bucket.fill_pct if self.itpm_bucket else 100.0,
-            avg_decode_tps_per_user=((output_tokens / duration) / self.in_flight_decoding) if self.in_flight_decoding > 0 and duration > 0 else 0.0,
+            avg_decode_tps_per_user=((content_tokens / duration) / self.in_flight_decoding) if self.in_flight_decoding > 0 and duration > 0 else 0.0,
             # Workload experience metrics
             effective_ttft_avg=np.mean([m.effective_ttft for m in period_prefill_metrics]) if period_prefill_metrics else 0.0,
             effective_ttft_p50=np.percentile([m.effective_ttft for m in period_prefill_metrics], 50) if period_prefill_metrics else 0.0,
@@ -2494,10 +2548,10 @@ class TestOrchestrator:
             logger.info(f"  {metric_name}: {measured_ttft:.2f}s {threshold_status} (threshold: {self.config.max_ttft}s, headroom: {metrics.ttft_headroom_pct:.0f}%)")
         has_prefill_data = len(self.period_metrics) > 0
         input_tps_str = f"{metrics.input_tokens_per_second:,.0f} input tok/s" if has_prefill_data else "⏳ No data input tok/s"
-        # Output tok/s is measured from live decode chunks; 0 means no chunks
-        # observed in the window (no decode activity), which is the same as no data.
+        tokens_tps_str = f"{metrics.tokens_per_second:,.0f} tok/s" if metrics.tokens_per_second > 0 else "⏳ No data tok/s"
         output_tps_str = f"{metrics.output_tokens_per_second:,.0f} output tok/s" if metrics.output_tokens_per_second > 0 else "⏳ No data output tok/s"
-        logger.info(f"  Throughput: {input_tps_str} | {output_tps_str}")
+        logger.info(f"  TTFC avg/p95: {metrics.ttfc_avg:.2f}s / {metrics.ttfc_p95:.2f}s")
+        logger.info(f"  Throughput: {input_tps_str} | {tokens_tps_str} | {output_tps_str}")
         cache_str = f"{metrics.avg_cache_hit_rate:.1%}" if has_prefill_data else "⏳ No data"
         logger.info(f"  Workload Cache Hit Rate: {cache_str} | New input tokens: {metrics.new_tokens_ingested:,} (budget: {self.config.max_new_tokens_per_period:,})")
 
@@ -2581,7 +2635,10 @@ class TestOrchestrator:
                 self.in_flight_decoding += 1
 
             def on_chunk(chunk_time, chunk_tokens):
-                self.output_token_log.append((chunk_time, chunk_tokens))
+                self.all_token_log.append((chunk_time, chunk_tokens))
+
+            def on_content_chunk(chunk_time, chunk_tokens):
+                self.content_token_log.append((chunk_time, chunk_tokens))
 
             result = await self.api_client.send_request(
                 messages,
@@ -2589,6 +2646,7 @@ class TestOrchestrator:
                 stream=stream,
                 on_first_token=on_first_token,
                 on_chunk=on_chunk,
+                on_content_chunk=on_content_chunk,
                 tokenizer=self.generator.tokenizer
             )
 
@@ -2613,14 +2671,19 @@ class TestOrchestrator:
         # Unpack result
         response_text = result['response_text']
         ttft = result['ttft']
+        ttfc = result['ttfc']
         ttlt = result['ttlt']
         actual_output = result['output_tokens']
+        content_output = result['content_tokens']
         error_type = result['error_type']
         request_start_time = result['start_time']
         prefill_complete_time = result['first_token_time']
+        first_content_time = result['first_content_time']
         request_complete_time = result['complete_time']
         token_timestamps = result['token_timestamps']
         tokens_per_chunk = result['tokens_per_chunk']
+        content_token_timestamps = result['content_token_timestamps']
+        content_tokens_per_chunk = result['content_tokens_per_chunk']
 
         # Track connection errors
         if error_type == "connection":
@@ -2636,7 +2699,11 @@ class TestOrchestrator:
         elif error_type is None:
             # Successful request resets consecutive error counter
             self.consecutive_connection_errors = 0
-            logger.debug(f"  📥 {user.user_id} req {user.current_idx + 1}: complete (TTFT: {ttft:.2f}s, {actual_output} output tokens, {ttlt:.2f}s total)")
+            logger.debug(
+                f"  📥 {user.user_id} req {user.current_idx + 1}: complete "
+                f"(TTFT: {ttft:.2f}s, TTFC: {ttfc:.2f}s, {actual_output} total tokens, "
+                f"{content_output} content tokens, {ttlt:.2f}s total)"
+            )
 
         # Store actual assistant response for use in subsequent requests' history
         user.store_assistant_response(response_text, actual_output, request)
@@ -2660,9 +2727,11 @@ class TestOrchestrator:
             input_tokens=request['input_tokens'],
             output_tokens_expected=expected_output,
             output_tokens_actual=actual_output,
+            content_tokens_actual=content_output,
             cache_hit_blocks=cache_hits,
             cache_miss_blocks=cache_misses,
             ttft=ttft,
+            ttfc=ttfc,
             ttlt=ttlt,
             itl=itl,
             delay_expected=user.get_delay_until_next(),
@@ -2672,9 +2741,12 @@ class TestOrchestrator:
             success=error_type is None,
             request_start_time=request_start_time,
             prefill_complete_time=prefill_complete_time,
+            first_content_time=first_content_time,
             request_complete_time=request_complete_time,
             token_timestamps=token_timestamps,
-            tokens_per_chunk=tokens_per_chunk
+            tokens_per_chunk=tokens_per_chunk,
+            content_token_timestamps=content_token_timestamps,
+            content_tokens_per_chunk=content_tokens_per_chunk,
         )
 
         user.metrics.append(metrics)
@@ -2942,10 +3014,12 @@ class TestOrchestrator:
                     # Prune old blocks from working set tracking (keeps 15m window)
                     self.prune_old_blocks(self.config.cache_max_age)
 
-                    # Prune old output token log entries (keep 15 minutes)
+                    # Prune old token log entries (keep 15 minutes)
                     cutoff = time.time() - 900
-                    while self.output_token_log and self.output_token_log[0][0] < cutoff:
-                        self.output_token_log.popleft()
+                    while self.all_token_log and self.all_token_log[0][0] < cutoff:
+                        self.all_token_log.popleft()
+                    while self.content_token_log and self.content_token_log[0][0] < cutoff:
+                        self.content_token_log.popleft()
 
                     # Calculate metrics based on timestamps (which requests' TTFT fell in this period)
                     pending_start_times = [start_time for _, start_time in pending_tasks.values()]
@@ -3021,8 +3095,10 @@ class TestOrchestrator:
         elapsed = time.time() - self.test_start_time if self.test_start_time else 0
 
         ttfts = [m.ttft for m in self.all_metrics if m.success]
+        ttfcs = [m.ttfc for m in self.all_metrics if m.success and m.ttfc > 0]
         total_input = sum(m.input_tokens for m in self.all_metrics)
-        total_output = sum(m.output_tokens_actual for m in self.all_metrics)
+        total_tokens = sum(m.output_tokens_actual for m in self.all_metrics)
+        total_content = sum(m.content_tokens_actual for m in self.all_metrics)
 
         cache_hits = sum(m.cache_hit_blocks for m in self.all_metrics)
         cache_total = cache_hits + sum(m.cache_miss_blocks for m in self.all_metrics)
@@ -3038,7 +3114,12 @@ class TestOrchestrator:
         logger.info(f"{Colors.METRIC}Performance Summary:{Colors.ENDC}")
         if ttfts:
             logger.info(f"  TTFT avg/p50/p95/max: {np.mean(ttfts):.2f}s / {np.percentile(ttfts, 50):.2f}s / {np.percentile(ttfts, 95):.2f}s / {max(ttfts):.2f}s")
-        logger.info(f"  Throughput: {total_input/elapsed:,.0f} input tok/s | {total_output/elapsed:,.0f} output tok/s")
+        if ttfcs:
+            logger.info(f"  TTFC avg/p50/p95/max: {np.mean(ttfcs):.2f}s / {np.percentile(ttfcs, 50):.2f}s / {np.percentile(ttfcs, 95):.2f}s / {max(ttfcs):.2f}s")
+        logger.info(
+            f"  Throughput: {total_input/elapsed:,.0f} input tok/s | "
+            f"{total_tokens/elapsed:,.0f} tok/s | {total_content/elapsed:,.0f} output tok/s"
+        )
         logger.info(f"  Avg Workload Cache Hit Rate: {cache_hits/cache_total:.1%}" if cache_total > 0 else "  Cache hits: N/A")
         logger.info(f"  Peak Working Set: {self.peak_working_set_tokens:,} tokens")
         if self.canonical_prefix_tokens > 0:
@@ -3122,6 +3203,16 @@ def generate_graphs(orchestrator: TestOrchestrator, config: TestConfig):
                    name='TTFT p99', mode='lines+markers', line=dict(color='#9b59b6', dash='dash')),
         row=1, col=1
     )
+    fig.add_trace(
+        go.Scatter(x=x_vals, y=[p.ttfc_p50 for p in periods],
+                   name='TTFC p50', mode='lines+markers', line=dict(color='#f39c12')),
+        row=1, col=1
+    )
+    fig.add_trace(
+        go.Scatter(x=x_vals, y=[p.ttfc_p95 for p in periods],
+                   name='TTFC p95', mode='lines+markers', line=dict(color='#d35400', dash='dot')),
+        row=1, col=1
+    )
 
     # Add threshold line
     fig.add_hline(y=config.max_ttft, line_dash="dash", line_color="red",
@@ -3131,6 +3222,11 @@ def generate_graphs(orchestrator: TestOrchestrator, config: TestConfig):
     fig.add_trace(
         go.Scatter(x=x_vals, y=[p.input_tokens_per_second for p in periods],
                    name='Input tok/s', mode='lines+markers', line=dict(color='#3498db')),
+        row=2, col=1
+    )
+    fig.add_trace(
+        go.Scatter(x=x_vals, y=[p.tokens_per_second for p in periods],
+                   name='Tok/s (all)', mode='lines+markers', line=dict(color='#1abc9c')),
         row=2, col=1
     )
     fig.add_trace(
@@ -3256,7 +3352,13 @@ def generate_graphs(orchestrator: TestOrchestrator, config: TestConfig):
                         y=[user_id],
                         mode='markers',
                         marker=dict(size=6, color=color, symbol='diamond'),
-                        hovertemplate=f"{user_id}<br>Request {req.request_idx}<br>t={t:.1f}s<br>TTFT: {req.ttft:.2f}s<br>In: {req.input_tokens:,} tok<br>Out: {req.output_tokens_actual} tok<extra></extra>",
+                        hovertemplate=(
+                            f"{user_id}<br>Request {req.request_idx}<br>t={t:.1f}s<br>"
+                            f"TTFT: {req.ttft:.2f}s<br>TTFC: {req.ttfc:.2f}s<br>"
+                            f"In: {req.input_tokens:,} tok<br>"
+                            f"Total: {req.output_tokens_actual} tok<br>"
+                            f"Content: {req.content_tokens_actual} tok<extra></extra>"
+                        ),
                         showlegend=False
                     ))
 
